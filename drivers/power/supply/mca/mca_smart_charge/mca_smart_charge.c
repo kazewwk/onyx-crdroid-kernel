@@ -128,14 +128,29 @@ struct mca_sysfs_attr_info smartchg_sysfs_field_tbl[] = {
 			  board_temp),
 	mca_sysfs_attr_rw(smart_charge_sysfs, 0664, MCA_PROP_SMART_SIC_MODE,
 			  smart_sic_mode),
+	mca_sysfs_attr_rw(smart_charge_sysfs, 0644, MCA_PROP_BYPASS_REQUESTED,
+			  bypass_requested),
 };
 
 #define SMARTCHG_SYSFS_ATTRS_SIZE ARRAY_SIZE(smartchg_sysfs_field_tbl)
 
 static struct attribute *smartchg_sysfs_attrs[SMARTCHG_SYSFS_ATTRS_SIZE + 1];
 
+static umode_t smart_charge_attr_is_visible(struct kobject *kobj,
+					   struct attribute *attr, int n)
+{
+	struct smart_charge_info *info = dev_get_drvdata(kobj_to_dev(kobj));
+
+	if (smartchg_sysfs_field_tbl[n].sysfs_attr_name == MCA_PROP_BYPASS_REQUESTED &&
+	    !info->support_bypass)
+		return 0;
+
+	return attr->mode;
+}
+
 static const struct attribute_group smartchg_sysfs_attr_group = {
 	.attrs = smartchg_sysfs_attrs,
+	.is_visible = smart_charge_attr_is_visible,
 };
 
 void mca_smartchg_set_scene(int scene)
@@ -690,7 +705,7 @@ static void smartcharging_handle_controlmessage(void)
 			info, SMART_CHG_TRAVELWAIT_PWR_BOOST);
 	} else if (info->smart_chg_control.smart_bypass) {
 		info->bypass_reserved = 0;
-		info->bypass_enable = info->smart_chg_control.enable & 1;
+		WRITE_ONCE(info->bypass_enable, info->smart_chg_control.enable & 1);
 	}
 }
 
@@ -780,54 +795,40 @@ static void smart_charge_plugin_or_plugout_reset(struct smart_charge_info *info)
 
 static void smart_charge_csd_send_pulse(struct smart_charge_info *info)
 {
-	int soc = 0, rsoc = 0;
-	int batt_temp = 0;
-	bool smart_night = false;
+	bool night = info->smart_chg_data.smart_chgcfg[SMART_CHG_NIGHT].enable;
+	bool cycle_due = info->plugin_rsoc <= 45 && !info->screen_state &&
+			 info->cycle_count > 100 && info->cycle_count % 25 == 0;
+	int soc, rsoc = 0, batt_temp = 0, mode = 0;
 
-	soc = strategy_class_fg_ops_get_soc();
-	strategy_class_fg_ops_get_rsoc(&rsoc);
-	(void)strategy_class_fg_ops_get_temperature(&batt_temp);
-	batt_temp /= 10;
-	smart_night = info->smart_chg_data.smart_chgcfg[SMART_CHG_NIGHT].enable;
+	if (info->pulse_mode) {
+		if (info->cycle_count % 25 == 0 || night)
+			return;
+	} else {
+		if (!cycle_due && !night)
+			return;
+		soc = strategy_class_fg_ops_get_soc();
+		if (soc < 50 || soc > 80)
+			return;
+		strategy_class_fg_ops_get_rsoc(&rsoc);
+		if (cycle_due && rsoc == 50)
+			mode = 1;
+		else if (night && info->night_enable_rsoc <= 45 && rsoc == 50)
+			mode = 2;
+		else if (night && info->night_enable_rsoc > 45 && rsoc == 76)
+			mode = 3;
+		else
+			return;
 
-	if (!info->pulse_mode) {
-		if ((soc >= 50 && soc <= 80) &&
-		    (batt_temp >= 20 && batt_temp <= 45)) {
-			if (info->plugin_rsoc <= 45 && !info->screen_state &&
-			    info->cycle_count > 100 &&
-			    (info->cycle_count % 25 == 0) && rsoc == 50) {
-				info->pulse_mode = 1;
-				mca_event_block_notify(MCA_EVENT_CHARGE_STATUS,
-						       MCA_EVENT_CSD_SEND_PULSE,
-						       &info->pulse_mode);
-			} else if (smart_night == true) {
-				if (info->night_enable_rsoc <= 45 &&
-				    rsoc == 50) {
-					info->pulse_mode = 2;
-					mca_event_block_notify(
-						MCA_EVENT_CHARGE_STATUS,
-						MCA_EVENT_CSD_SEND_PULSE,
-						&info->pulse_mode);
-				} else if (info->night_enable_rsoc > 45 &&
-					   rsoc == 76) {
-					info->pulse_mode = 3;
-					mca_event_block_notify(
-						MCA_EVENT_CHARGE_STATUS,
-						MCA_EVENT_CSD_SEND_PULSE,
-						&info->pulse_mode);
-				}
-			}
-		}
-	} else if ((info->cycle_count % 25 != 0) && smart_night == false) {
-		info->pulse_mode = 0;
-		mca_event_block_notify(MCA_EVENT_CHARGE_STATUS,
-				       MCA_EVENT_CSD_SEND_PULSE,
-				       &info->pulse_mode);
+		(void)strategy_class_fg_ops_get_temperature(&batt_temp);
+		batt_temp /= 10;
+		if (batt_temp < 20 || batt_temp > 45)
+			return;
 	}
-	mca_log_info(
-		"soc: %d, rsoc: %d, plugin_rsoc: %d, night_enable_rsoc: %d, batt_temp: %d, cycle: %d, night: %d, pulse_mode: %d",
-		soc, rsoc, info->plugin_rsoc, info->night_enable_rsoc,
-		batt_temp, info->cycle_count, smart_night, info->pulse_mode);
+
+	info->pulse_mode = mode;
+	mca_event_block_notify(MCA_EVENT_CHARGE_STATUS, MCA_EVENT_CSD_SEND_PULSE,
+			       &info->pulse_mode);
+	mca_log_info("CSD pulse mode %d, cycle %d\n", mode, info->cycle_count);
 }
 
 static int smart_charge_thermal_notifier_cb(struct notifier_block *nb,
@@ -936,8 +937,8 @@ static void smart_charge_handle_bypass_chg(struct smart_charge_info *info)
 	if (!info->support_bypass)
 		return;
 
-	state = info->bypass_enable;
-	if (info->bypass_enable == 0)
+	state = READ_ONCE(info->bypass_enable);
+	if (!state)
 		goto report;
 
 	soc = strategy_class_fg_ops_get_soc();
@@ -1233,6 +1234,8 @@ static ssize_t smart_charge_sysfs_show(struct device *dev,
 		val = get_smart_chg_message();
 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
 		break;
+	case MCA_PROP_BYPASS_REQUESTED:
+		return sysfs_emit(buf, "%u\n", (unsigned int)READ_ONCE(info->bypass_enable));
 	case MCA_PROP_SMARTBATT:
 		val = get_smart_batt_message();
 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
@@ -1306,6 +1309,11 @@ static ssize_t smart_charge_sysfs_store(struct device *dev,
 	switch (attr_info->sysfs_attr_name) {
 	case MCA_PROP_SMARTCHG:
 		smartcharging_receive_control_message(val);
+		break;
+	case MCA_PROP_BYPASS_REQUESTED:
+		if (val != 0 && val != 1)
+			return -EINVAL;
+		WRITE_ONCE(info->bypass_enable, val);
 		break;
 	case MCA_PROP_SMARTBATT:
 		handle_smart_batt_message(val);

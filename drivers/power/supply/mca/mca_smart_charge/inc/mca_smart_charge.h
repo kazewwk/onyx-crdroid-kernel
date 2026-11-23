@@ -250,6 +250,7 @@ enum smartchg_attr_list {
 	MCA_PROP_SCENE,
 	MCA_PROP_BOARD_TEMP,
 	MCA_PROP_SMART_SIC_MODE,
+	MCA_PROP_BYPASS_REQUESTED,
 };
 
 enum smartchg_cell_type {

@@ -1,0 +1,10 @@
+What:		/sys/class/xm_power/charger/smart_charge/bypass_requested
+Date:		November 2026
+Description:
+		Read or write the request bit for the Xiaomi MCA smart bypass
+		charging policy. Accepted values are 0 and 1. The driver exposes
+		this attribute on boards that declare smart_bypass_support and
+		supply the corresponding policy tables. The charging worker
+		evaluates the request against the board's state of charge,
+		temperature, charger and scene settings. Reading 1 reports the
+		request. Actual battery and input currents require measurement.
