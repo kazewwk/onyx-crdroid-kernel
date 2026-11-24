@@ -781,7 +781,7 @@ static int handle_smart_night_message(int val)
 
 	info->smart_night_val = val;
 	mca_log_info("smart_night_val is %d\n", !!val);
-	if (val)
+	if (val && info->support_csd)
 		strategy_class_fg_ops_get_rsoc(&info->night_enable_rsoc);
 	if (!!val == 1 || !!val == 0) {
 		info->smart_chg_data.smart_chgcfg[SMART_CHG_NIGHT].enable = val;
@@ -1104,7 +1104,8 @@ static int mca_smart_charge_process_event(int event, int value, void *data)
 		fallthrough;
 	case MCA_EVENT_USB_CONNECT:
 		WRITE_ONCE(info->online, 1);
-		strategy_class_fg_ops_get_rsoc(&info->plugin_rsoc);
+		if (info->support_csd)
+			strategy_class_fg_ops_get_rsoc(&info->plugin_rsoc);
 		smart_charge_plugin_or_plugout_reset(info);
 		cancel_delayed_work_sync(&info->smart_charge_work);
 		schedule_delayed_work(&info->smart_charge_work, 0);
