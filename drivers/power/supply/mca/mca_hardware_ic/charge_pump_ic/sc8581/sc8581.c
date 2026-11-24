@@ -21,6 +21,7 @@
 #include "inc/sc8581_reg.h"
 #include "inc/sc8581.h"
 #include <mca/common/mca_log.h>
+#include <mca/common/mca_onyx_supply_hold.h>
 #include <mca/common/mca_event.h>
 #include <linux/version.h>
 #include <mca/common/mca_parse_dts.h>
@@ -331,6 +332,15 @@ static int sc8581_check_charge_enabled(struct sc8581_device *bq, bool *enabled)
 		*enabled = !!(val & SC8581_CHG_EN_MASK);
 
 	return ret;
+}
+
+static int onyx_pump_on(void *data, bool *on)
+{
+	struct sc8581_device *bq = data;
+
+	if (!READ_ONCE(bq->i2c_is_working))
+		return -EIO;
+	return sc8581_check_charge_enabled(bq, on);
 }
 
 static int sc8581_enable_qb(struct sc8581_device *bq, bool enable)
@@ -2571,6 +2581,11 @@ static int sc8581_probe(struct i2c_client *client,
 	mca_log_charge_log_register(MCA_CHARGE_LOG_ID_CP_MASTER_IC,
 				    &g_sc8581_log_ops, bq);
 	device_init_wakeup(bq->dev, true);
+	if (bq->cp_role == CP_ROLE_MASTER &&
+	    of_device_is_compatible(bq->dev->of_node, "sc8581"))
+		onyx_hold_register(ONYX_CP, &(struct onyx_hold_source) {
+			.dev = bq->dev, .data = bq, .pump_on = onyx_pump_on,
+		});
 	mca_log_err("%s probe success %d\n", bq->log_tag, ret);
 
 	return 0;
@@ -2619,6 +2634,8 @@ static void sc8581_remove(struct i2c_client *client)
 {
 	struct sc8581_device *bq = i2c_get_clientdata(client);
 	int ret = 0;
+
+	onyx_hold_unregister(ONYX_CP, bq->dev);
 
 	ret = cp_enable_adc(bq, false);
 	if (ret)

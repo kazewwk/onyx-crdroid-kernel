@@ -28,6 +28,7 @@
 #include <linux/version.h>
 #include <mca/platform/platform_fg_ic_ops.h>
 #include <mca/common/mca_log.h>
+#include <mca/common/mca_onyx_supply_hold.h>
 #include <mca/common/mca_parse_dts.h>
 #include <mca/smartchg/smart_chg_class.h>
 #include <linux/unistd.h>
@@ -6105,6 +6106,29 @@ static int fg_get_one_average_current(void *data, int *val)
 	return 0;
 }
 
+/* Unlike the public FG getters, never substitute fake or last-good values. */
+static int onyx_fg_sample(void *data, struct onyx_hold_sample *s)
+{
+	struct bq_fg_chip *bq = data;
+	u16 temp, curr, soc;
+
+	if (READ_ONCE(bq->fg_error) || READ_ONCE(bq->ota_update_flag) ||
+	    READ_ONCE(bq->fake_temp) != FG_FAKE_TEMP_NONE ||
+	    atomic_read(&bq->pm_suspend) || atomic_read(&bq->digest_in_process))
+		return -EIO;
+	if (fg_read_word(bq, bq->regs[BQ_FG_REG_TEMP], &temp) < 0 ||
+	    fg_read_word(bq, bq->regs[BQ_FG_REG_CN], &curr) < 0 ||
+	    fg_read_word(bq, bq->regs[BQ_FG_REG_SOC], &soc) < 0)
+		return -EIO;
+	s->temp = (int)temp - 2730;
+	s->ma = -(int)(s16)curr;
+	s->soc = soc;
+	if (s->temp < FG_TEMP_LOW_TH || s->temp > FG_TEMP_HIGH_TH ||
+	    s->ma < FG_CURR_LOW_TH || s->ma > FG_CURR_HIGH_TH || soc > 100)
+		return -ERANGE;
+	return 0;
+}
+
 static struct fuelguage_ic_ops g_bq_fg_ops = {
 	.fg_ic_probe_ok = fg_read_one_probe_ok,
 	.fg_ic_get_batt_info = fg_read_batt_info,
@@ -6327,6 +6351,11 @@ static int bq_fg_probe(struct i2c_client *client, const struct i2c_device_id *id
 	mca_log_err("FuelGaugw probe successfully, role = %u\n", bq->dev_role);
 
 	fg_force_sim_soh_if_needed(bq);
+	if (bq->dev_role == FG_IC_MASTER &&
+	    of_device_is_compatible(bq->dev->of_node, "ti,bq27z561_master"))
+		onyx_hold_register(ONYX_GAUGE, &(struct onyx_hold_source) {
+			.dev = bq->dev, .data = bq, .sample = onyx_fg_sample,
+		});
 out:
 	fg_sysfs_create_group(bq);
 	i2c_set_clientdata(client, bq);
@@ -6377,6 +6406,7 @@ static void bq_fg_remove(struct i2c_client *client)
 {
 	struct bq_fg_chip *bq = i2c_get_clientdata(client);
 
+	onyx_hold_unregister(ONYX_GAUGE, bq->dev);
 	mutex_destroy(&bq->data_lock);
 	mutex_destroy(&bq->i2c_rw_lock);
 	fg_sysfs_remove_group(bq->sysfs_dev);

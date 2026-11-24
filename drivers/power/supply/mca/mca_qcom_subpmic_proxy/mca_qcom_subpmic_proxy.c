@@ -15,6 +15,7 @@
 #include <linux/pm_wakeup.h>
 
 #include <mca/common/mca_log.h>
+#include <mca/common/mca_onyx_supply_hold.h>
 #include <mca/common/mca_event.h>
 #include <mca/common/mca_hwid.h>
 #include <mca/common/mca_parse_dts.h>
@@ -433,6 +434,12 @@ static int qcom_subpmic_get_otg_boost_enable_status(void *data, int *val)
 					sizeof(*val));
 }
 
+static int onyx_usb_online(void *data, int *online)
+{
+	return mca_adsp_glink_read_prop(SUBPMIC_PROP_USB_ONLINE, online,
+				       sizeof(*online));
+}
+
 static int qcom_subpmic_get_online(void *data, int *online)
 {
 	struct qcom_subpmic *sc = data;
@@ -550,9 +557,8 @@ static int qcom_subpmic_enable_charging(void *data, bool en)
 	u8 val = en;
 
 	mca_log_info("enable charging: %d\n", en & 1);
-	mca_adsp_glink_write_prop(SUBPMIC_PROP_ENABLE_CHARGING, &val,
-				  sizeof(val));
-	return 0;
+	return mca_adsp_glink_write_prop(SUBPMIC_PROP_ENABLE_CHARGING, &val,
+					sizeof(val));
 }
 
 static int qcom_subpmic_set_buck_fsw(void *data, int khz)
@@ -856,6 +862,7 @@ static void qcom_subpmic_update_usb_type_work(struct work_struct *work)
 		mca_log_err("usb online: %d\n", usb_online);
 		sc->online = usb_online;
 		if (usb_online == 0) {
+			onyx_hold_wire_changed();
 			protocol_class_pd_set_pd_active(0, 0);
 			mca_event_block_notify(MCA_EVENT_TYPE_CHARGER_CONNECT,
 					       MCA_EVENT_USB_DISCONNECT, NULL);
@@ -1008,6 +1015,7 @@ static void qcom_subpmic_glink_down_cb(void *priv)
 
 	mca_log_info("glink down\n");
 	sc->glink_down = 1;
+	onyx_hold_wire_changed();
 	mca_event_block_notify(MCA_EVENT_CHARGE_STATUS,
 			       SUBPMIC_RAW_CODE_GLINK_DOWN, NULL);
 }
@@ -1068,6 +1076,8 @@ static void qcom_subpmic_notify_cb(u32 notify_type, void *data, u32 len,
 
 	switch (notify_type) {
 	case SUBPMIC_NOTIFY_USB_TYPE:
+		/* An unplug/replug can be coalesced by update_usb_type_work. */
+		onyx_hold_wire_changed();
 		queue_delayed_work(system_wq, &sc->update_usb_type_work, 0);
 		break;
 	case SUBPMIC_NOTIFY_CHARGE_TYPE:
@@ -1286,6 +1296,9 @@ static int qcom_subpmic_probe(struct platform_device *pdev)
 
 	queue_delayed_work(system_wq, &sc->update_usb_type_work, 0);
 	queue_delayed_work(system_wq, &sc->sync_cfg_work, msecs_to_jiffies(25));
+	onyx_hold_register(ONYX_USB, &(struct onyx_hold_source) {
+		.dev = &pdev->dev, .data = sc, .online = onyx_usb_online,
+	});
 	mca_log_err("probe ok\n");
 	return 0;
 
@@ -1297,6 +1310,7 @@ err:
 
 static int qcom_subpmic_remove(struct platform_device *pdev)
 {
+	onyx_hold_unregister(ONYX_USB, &pdev->dev);
 	return 0;
 }
 

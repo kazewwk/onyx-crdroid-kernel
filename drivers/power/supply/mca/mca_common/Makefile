@@ -1,5 +1,5 @@
 obj-$(CONFIG_XM_POWER_SUPPLY)	+= mca_common.o
-mca_common-objs := mca_voter.o
+mca_common-objs := mca_voter.o mca_onyx_supply_hold.o
 
 obj-$(CONFIG_XM_POWER_SUPPLY)	+= mca_sysfs.o
 obj-$(CONFIG_XM_POWER_SUPPLY)	+= mca_event.o

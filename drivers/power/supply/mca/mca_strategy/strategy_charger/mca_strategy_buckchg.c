@@ -32,6 +32,7 @@
 #include <mca/common/mca_parse_dts.h>
 #include <mca/common/mca_voter.h>
 #include <mca/common/mca_log.h>
+#include <mca/common/mca_onyx_supply_hold.h>
 #include <mca/common/mca_event.h>
 #include <mca/common/mca_charge_interface.h>
 #include <mca/strategy/strategy_class.h>
@@ -2070,7 +2071,7 @@ strategy_buckchg_check_charge_volt(struct strategy_buckchg_dev *info)
 		mca_vote(info->input_limit_voter, "non_compliant_qc", true,
 			 1500);
 		strategy_class_buckchg_ops_set_chg(info, false);
-		strategy_class_buckchg_ops_set_chg(info, true);
+		mca_rerun_election(info->chg_enable_voter);
 		mca_log_err("restart aicl and recover buck charging\n");
 		platform_class_buckchg_ops_set_rerun_aicl(MAIN_BUCK_CHARGER,
 							  true);
@@ -2608,7 +2609,7 @@ qc_status:
 		if (chg_en &&
 		    info->proc_data.chg_status == MCA_BUCK_CHG_NO_CHARGING) {
 			strategy_class_buckchg_ops_set_chg(info, false);
-			strategy_class_buckchg_ops_set_chg(info, true);
+			mca_rerun_election(info->chg_enable_voter);
 			mca_log_err("recover buck charging\n");
 		}
 	}
@@ -3468,12 +3469,16 @@ static int strategy_buckchg_class_probe(struct platform_device *pdev)
 	mca_log_err("androidboot.mode=%d\n", mca_log_get_charge_boot_mode());
 
 	info->strategy_init_done = 1;
+	onyx_hold_register(ONYX_BUCK, &(struct onyx_hold_source) {
+		.dev = &pdev->dev, .buck = info->chg_enable_voter,
+	});
 	mca_log_err("probe success\n");
 	return 0;
 }
 
 static int strategy_buckchg_class_remove(struct platform_device *pdev)
 {
+	onyx_hold_unregister(ONYX_BUCK, &pdev->dev);
 	return 0;
 }
 

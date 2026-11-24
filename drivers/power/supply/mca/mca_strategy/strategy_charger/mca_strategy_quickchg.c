@@ -32,6 +32,7 @@
 #include <mca/common/mca_parse_dts.h>
 #include <mca/common/mca_event.h>
 #include <mca/common/mca_log.h>
+#include <mca/common/mca_onyx_supply_hold.h>
 #include <mca/common/mca_voter.h>
 #include <mca/common/mca_sysfs.h>
 #include <mca/common/mca_charge_interface.h>
@@ -2063,7 +2064,8 @@ mca_quick_charge_pre_charge_check(struct mca_quick_charge_info *info)
 	int ret;
 	bool cp_present = false;
 
-	if (info->proc_data.charge_flag == MCA_QUICK_CHG_STS_CHARGING)
+	if (onyx_hold_quick_blocked() ||
+	    info->proc_data.charge_flag == MCA_QUICK_CHG_STS_CHARGING)
 		return;
 
 	// quick charge driver is slow to load on power up, may miss the first charger plug-in event
@@ -2165,7 +2167,9 @@ mca_quick_charge_pre_charge_check(struct mca_quick_charge_info *info)
 	mca_quick_charge_update_work_mode_para(info);
 	mutex_lock(&info->data_lock);
 	mca_log_info("Acquire mutex_lock\n");
-	mca_quick_charge_start_charging(info);
+	/* Admission and start share data_lock: no check-then-start race. */
+	if (!onyx_hold_quick_blocked())
+		mca_quick_charge_start_charging(info);
 	mutex_unlock(&info->data_lock);
 	mca_log_info("Release mutex_lock\n");
 }
@@ -5607,6 +5611,16 @@ static struct mca_smartchg_if_ops g_quickchg_smartchg_if_ops = {
 	.set_pwr_boost_sts = strategy_quickchg_smartchg_pwr_boost_sts_callback,
 };
 
+/* Read under data_lock; the sole start path holds the same mutex. */
+static bool onyx_quick_idle(void *data)
+{
+	struct mca_quick_charge_info *info = data;
+
+	return info->cp_type == MCA_CP_TYPE_SINGLE &&
+	       READ_ONCE(info->proc_data.charge_flag) ==
+			MCA_QUICK_CHG_STS_NO_CHARGING;
+}
+
 static int mca_quick_charge_probe(struct platform_device *pdev)
 {
 	int ret = 0;
@@ -5691,6 +5705,10 @@ static int mca_quick_charge_probe(struct platform_device *pdev)
 	ret = register_reboot_notifier(&info->shutdown_notifier);
 	if (ret < 0)
 		mca_log_err("register reboot notify failed\n");
+	onyx_hold_register(ONYX_QUICK, &(struct onyx_hold_source) {
+		.dev = &pdev->dev, .data = info,
+		.quick = { .lock = &info->data_lock, .idle = onyx_quick_idle },
+	});
 	mca_log_err("probe end\n");
 
 	return 0;
@@ -5698,6 +5716,7 @@ static int mca_quick_charge_probe(struct platform_device *pdev)
 
 static int mca_quick_charge_remove(struct platform_device *pdev)
 {
+	onyx_hold_unregister(ONYX_QUICK, &pdev->dev);
 	mca_quick_charge_remove_group(&pdev->dev);
 	return 0;
 }
