@@ -60,6 +60,8 @@
 
 #define SMART_CHG_SOCLMT_TRIG_DEFAULT 80
 #define SMART_CHG_SOCLMT_CANCEL_DEFAULT 5
+#define SMART_CHG_USER_SOC_MIN 50
+#define SMART_CHG_USER_SOC_MAX 95
 #define SMART_CHARGE_DELTA_FV_DEFAULT_VALUE 0
 #define SMART_CHARGE_DELTA_ICHG_DEFAULT_VALUE 0
 #define SMART_CHARGE_DTPT_DELTA_VALUE 15
@@ -128,6 +130,8 @@ struct mca_sysfs_attr_info smartchg_sysfs_field_tbl[] = {
 			  board_temp),
 	mca_sysfs_attr_rw(smart_charge_sysfs, 0664, MCA_PROP_SMART_SIC_MODE,
 			  smart_sic_mode),
+	mca_sysfs_attr_rw(smart_charge_sysfs, 0644, MCA_PROP_USER_SOC_LIMIT,
+			  user_soc_limit),
 };
 
 #define SMARTCHG_SYSFS_ATTRS_SIZE ARRAY_SIZE(smartchg_sysfs_field_tbl)
@@ -226,9 +230,7 @@ int mca_smartchg_get_limit_soc(void)
 		mca_log_err("info is null\n");
 		return 0;
 	}
-	if (info->soc_limit_enable)
-		return info->soc_limit;
-	return 0;
+	return READ_ONCE(info->active_soc_limit);
 }
 EXPORT_SYMBOL(mca_smartchg_get_limit_soc);
 
@@ -391,7 +393,7 @@ static void smart_charge_handle_sense_chg(struct smart_charge_info *info)
 
 static void smart_charge_set_soc_limit(bool enable)
 {
-	static struct mca_smartchg_if_ops *if_ops;
+	struct mca_smartchg_if_ops *if_ops;
 
 	for (int i = 0; i < MCA_SMARTCHG_IF_CHG_TYPE_END; i++) {
 		if_ops = mca_smartchg_if_get_ops(i);
@@ -401,30 +403,60 @@ static void smart_charge_set_soc_limit(bool enable)
 	}
 }
 
+static ssize_t smart_charge_store_user_limit(struct smart_charge_info *info,
+					     const char *buf, size_t count)
+{
+	int val;
+
+	if (memchr(buf, '\0', count) || kstrtoint(buf, 10, &val) ||
+	    (val && (val < SMART_CHG_USER_SOC_MIN || val > SMART_CHG_USER_SOC_MAX)))
+		return -EINVAL;
+
+	WRITE_ONCE(info->user_soc_limit, val);
+	mod_delayed_work(system_wq, &info->smart_soc_limit_work, 0);
+	return count;
+}
+
+/* The user ceiling can tighten, but never relax, the system ceiling. */
+static int smart_charge_effective_limit(int system_limit, int user_limit)
+{
+	return min_not_zero(system_limit, user_limit);
+}
+
 #define SMART_CHG_SOC_HYS 2
 static void smart_charge_soc_limit_workfunc(struct work_struct *work)
 {
 	struct smart_charge_info *info = container_of(
 		work, struct smart_charge_info, smart_soc_limit_work.work);
-	int curr_soc = 0;
+	int system_limit = READ_ONCE(info->soc_limit);
+	int limit = smart_charge_effective_limit(system_limit,
+						 READ_ONCE(info->user_soc_limit));
+	int curr_soc;
 
-	if (!info->online) {
+	if (!READ_ONCE(info->online)) {
 		mca_log_err("adapter is plugout, don't handle soc limit\n");
 		return;
 	}
 
-	if (info->soc_limit) {
+	if (limit) {
+		/* An uninitialised gauge can report a fallback 15; keep the vote. */
+		if (strategy_class_fg_ops_is_init_ok() <= 0)
+			goto recheck;
 		curr_soc = strategy_class_fg_ops_get_soc();
+		if (curr_soc < 0 || curr_soc > 100)
+			goto recheck;
 		mca_log_info("curr_soc = %d, soc_limit_thre = %d\n", curr_soc,
-			     info->soc_limit);
-		if (curr_soc >= info->soc_limit) {
+			     limit);
+		if (curr_soc >= limit) {
 			if (info->soc_limit_enable == false) {
 				info->soc_limit_enable = true;
 				smart_charge_set_soc_limit(
 					info->soc_limit_enable);
 			}
 
-			if (curr_soc >= info->soc_limit + SMART_CHG_SOC_HYS) {
+			/* OEM overshoot must use the OEM threshold. */
+			if (system_limit &&
+			    curr_soc >= system_limit + SMART_CHG_SOC_HYS) {
 				if (info->smart_chg_data
 					    .smart_chgcfg[SMART_CHG_ENDURANCE_PRO]
 					    .enable &&
@@ -447,18 +479,20 @@ static void smart_charge_soc_limit_workfunc(struct work_struct *work)
 				}
 			}
 
-		} else if (curr_soc <=
-			   info->soc_limit - SMART_CHG_SOCLMT_CANCEL_DEFAULT) {
+		} else if (curr_soc <= limit - SMART_CHG_SOCLMT_CANCEL_DEFAULT) {
 			if (info->soc_limit_enable == true) {
 				info->soc_limit_enable = false;
 				smart_charge_set_soc_limit(
 					info->soc_limit_enable);
 			}
 		}
+		WRITE_ONCE(info->active_soc_limit, info->soc_limit_enable ? limit : 0);
+recheck:
 		schedule_delayed_work(&info->smart_soc_limit_work,
 				      msecs_to_jiffies(1000));
 	} else {
 		mca_log_info("disable soc limit\n");
+		WRITE_ONCE(info->active_soc_limit, 0);
 		info->soc_limit_enable = false;
 		smart_charge_set_soc_limit(info->soc_limit_enable);
 	}
@@ -503,10 +537,8 @@ smartcharging_handle_algorithm_conflict(struct smart_charge_info *info)
 	} else {
 		soc_upper_thre = 0;
 	}
-	info->soc_limit = soc_upper_thre;
-	cancel_delayed_work_sync(&info->smart_soc_limit_work);
-	schedule_delayed_work(&info->smart_soc_limit_work, 0);
-	//smartcharging_handle_soc_limit_process(info, !!soc_upper_thre, info->soc_limit);
+	WRITE_ONCE(info->soc_limit, soc_upper_thre);
+	mod_delayed_work(system_wq, &info->smart_soc_limit_work, 0);
 }
 
 static void smartcharging_handle_wls_super(struct smart_charge_info *info)
@@ -1071,7 +1103,7 @@ static int mca_smart_charge_process_event(int event, int value, void *data)
 		info->wls_online = 1;
 		fallthrough;
 	case MCA_EVENT_USB_CONNECT:
-		info->online = 1;
+		WRITE_ONCE(info->online, 1);
 		strategy_class_fg_ops_get_rsoc(&info->plugin_rsoc);
 		smart_charge_plugin_or_plugout_reset(info);
 		cancel_delayed_work_sync(&info->smart_charge_work);
@@ -1083,13 +1115,14 @@ static int mca_smart_charge_process_event(int event, int value, void *data)
 		info->wls_online = 0;
 		fallthrough;
 	case MCA_EVENT_USB_DISCONNECT:
-		info->online = 0;
+		WRITE_ONCE(info->online, 0);
 		smart_charge_plugin_or_plugout_reset(info);
 		cancel_delayed_work_sync(&info->smart_charge_work);
 		cancel_delayed_work_sync(&info->smart_soc_limit_work);
 		//memset(&info->smart_chg_data, 0, sizeof(info->smart_chg_data));
 		memset(&info->smart_chg_control, 0,
 		       sizeof(info->smart_chg_control));
+		WRITE_ONCE(info->active_soc_limit, 0);
 		info->soc_limit_enable = false;
 		info->ignore_upload.AsUINT32 = 0;
 		smart_charge_set_soc_limit(info->soc_limit_enable);
@@ -1229,6 +1262,8 @@ static ssize_t smart_charge_sysfs_show(struct device *dev,
 	}
 
 	switch (attr_info->sysfs_attr_name) {
+	case MCA_PROP_USER_SOC_LIMIT:
+		return sysfs_emit(buf, "%d\n", READ_ONCE(info->user_soc_limit));
 	case MCA_PROP_SMARTCHG:
 		val = get_smart_chg_message();
 		count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
@@ -1299,6 +1334,9 @@ static ssize_t smart_charge_sysfs_store(struct device *dev,
 		mca_log_err("%s dev_driverdata is null\n", __func__);
 		return -1;
 	}
+
+	if (attr_info->sysfs_attr_name == MCA_PROP_USER_SOC_LIMIT)
+		return smart_charge_store_user_limit(info, buf, count);
 
 	if (kstrtoint(buf, 0, &val))
 		return -EINVAL;
@@ -1772,13 +1810,17 @@ static int smart_charge_probe(struct platform_device *pdev)
 
 	info->dev = &pdev->dev;
 	platform_set_drvdata(pdev, info);
+	INIT_DELAYED_WORK(&info->smart_charge_work, smart_charge_workfunc);
+	INIT_DELAYED_WORK(&info->smart_sense_chg_work,
+			  smart_charge_sense_chg_workfunc);
+	INIT_DELAYED_WORK(&info->smart_soc_limit_work,
+			  smart_charge_soc_limit_workfunc);
 	global_smartchg_info = info;
 	ret = smart_charge_parse_dt(info);
 	if (ret) {
 		mca_log_err("parse dt failed\n");
 		return -1;
 	}
-	smart_charge_sysfs_create_group(info->dev);
 	ret = smart_charge_init_voter(info);
 	if (ret) {
 		mca_log_err("init voter err\n");
@@ -1795,12 +1837,6 @@ static int smart_charge_probe(struct platform_device *pdev)
 	info->thermal_nb.notifier_call = smart_charge_thermal_notifier_cb;
 	mca_event_block_notify_register(MCA_EVENT_TYPE_THERMAL_TEMP,
 					&info->thermal_nb);
-
-	INIT_DELAYED_WORK(&info->smart_charge_work, smart_charge_workfunc);
-	INIT_DELAYED_WORK(&info->smart_sense_chg_work,
-			  smart_charge_sense_chg_workfunc);
-	INIT_DELAYED_WORK(&info->smart_soc_limit_work,
-			  smart_charge_soc_limit_workfunc);
 
 	(void)mca_strategy_func_get_status(STRATEGY_FUNC_TYPE_BUCK_CHARGE,
 					   STRATEGY_STATUS_TYPE_ONLINE,
@@ -1839,11 +1875,12 @@ static int smart_charge_probe(struct platform_device *pdev)
 	}
 
 	if (online || wireless_online) {
-		info->online = 1;
+		WRITE_ONCE(info->online, 1);
 		schedule_delayed_work(&info->smart_charge_work, 0);
 	}
 
 	info->fake_scene = SMART_CHARGE_FAKE_SCENE_DEFAULT;
+	smart_charge_sysfs_create_group(info->dev);
 
 	mca_log_info("done\n");
 	return 0;
@@ -1867,6 +1904,14 @@ static int smart_charge_remove(struct platform_device *pdev)
 	device_destroy(info->smart_charge_class, info->dev_num);
 	class_destroy(info->smart_charge_class);
 	smart_charge_sysfs_remove_group(&pdev->dev);
+	/* Drain sysfs-triggered checks and release our own hold. */
+	WRITE_ONCE(info->online, 0);
+	cancel_delayed_work_sync(&info->smart_charge_work);
+	cancel_delayed_work_sync(&info->smart_soc_limit_work);
+	if (info->soc_limit_enable) {
+		WRITE_ONCE(info->active_soc_limit, 0);
+		smart_charge_set_soc_limit(false);
+	}
 	mca_event_block_notify_unregister(MCA_EVENT_TYPE_PANEL,
 					  &info->panel_nb);
 

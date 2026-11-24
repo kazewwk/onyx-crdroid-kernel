@@ -183,7 +183,9 @@ struct smart_charge_info {
 
 	int delta_fv;
 	int delta_ichg;
-	int soc_limit;
+	int soc_limit; /* ceiling selected by the existing smart-charge policy */
+	int user_soc_limit; /* 0 lets the system policy decide */
+	int active_soc_limit; /* held ceiling for the fuel-gauge UI */
 	int online;
 	int cycle_count;
 	int cell_type;
@@ -250,6 +252,7 @@ enum smartchg_attr_list {
 	MCA_PROP_SCENE,
 	MCA_PROP_BOARD_TEMP,
 	MCA_PROP_SMART_SIC_MODE,
+	MCA_PROP_USER_SOC_LIMIT,
 };
 
 enum smartchg_cell_type {
