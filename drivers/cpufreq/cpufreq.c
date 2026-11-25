@@ -864,8 +864,26 @@ static ssize_t store_scaling_governor(struct cpufreq_policy *policy,
 static ssize_t store_onyx_profile(struct cpufreq_policy *policy,
 				  const char *buf, size_t count)
 {
-	if (memchr(buf, '\0', count) ||
-	    (!sysfs_streq(buf, "powersave") && !sysfs_streq(buf, "performance")))
+	const char *g;
+	ssize_t ret;
+
+	if (memchr(buf, '\0', count))
+		return -EINVAL;
+	if (count > 8 && !strncmp(buf, "restore:", 8)) {
+		g = buf + 8;
+		if (!sysfs_streq(g, "walt") && !sysfs_streq(g, "schedutil") &&
+		    !sysfs_streq(g, "conservative") && !sysfs_streq(g, "ondemand") &&
+		    !sysfs_streq(g, "powersave") && !sysfs_streq(g, "performance"))
+			return -EINVAL;
+		/* Hand back a selected mode; never replace another governor. */
+		if (!policy->governor ||
+		    (strcmp(policy->governor->name, "powersave") &&
+		     strcmp(policy->governor->name, "performance")))
+			return -EBUSY;
+		ret = store_scaling_governor(policy, g, count - 8);
+		return ret < 0 ? ret : count;
+	}
+	if (!sysfs_streq(buf, "powersave") && !sysfs_streq(buf, "performance"))
 		return -EINVAL;
 
 	return store_scaling_governor(policy, buf, count);

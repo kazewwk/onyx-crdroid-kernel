@@ -217,6 +217,7 @@ config CPU_FREQ_ONYX_PROFILE
 	  Expose onyx_profile on each CPUFreq policy. Write powersave or
 	  performance to select the corresponding native governor; read to
 	  see the current governor, including one selected by other tools.
+	  Use restore:<saved-governor> to hand back a selected mode.
 	  This does not set frequency limits or select a governor at boot.
 
 comment "CPU frequency scaling drivers"
