@@ -26,6 +26,7 @@
 #include <linux/mutex.h>
 #include <linux/pm_qos.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/suspend.h>
 #include <linux/syscore_ops.h>
 #include <linux/tick.h>
@@ -859,6 +860,21 @@ static ssize_t store_scaling_governor(struct cpufreq_policy *policy,
 	return ret ? ret : count;
 }
 
+#ifdef CONFIG_CPU_FREQ_ONYX_PROFILE
+static ssize_t store_onyx_profile(struct cpufreq_policy *policy,
+				  const char *buf, size_t count)
+{
+	if (memchr(buf, '\0', count) ||
+	    (!sysfs_streq(buf, "powersave") && !sysfs_streq(buf, "performance")))
+		return -EINVAL;
+
+	return store_scaling_governor(policy, buf, count);
+}
+
+static struct freq_attr onyx_profile =
+	__ATTR(onyx_profile, 0644, show_scaling_governor, store_onyx_profile);
+#endif
+
 /*
  * show_scaling_driver - show the cpufreq driver currently loaded
  */
@@ -993,6 +1009,9 @@ static struct attribute *cpufreq_attrs[] = {
 	&affected_cpus.attr,
 	&related_cpus.attr,
 	&scaling_governor.attr,
+#ifdef CONFIG_CPU_FREQ_ONYX_PROFILE
+	&onyx_profile.attr,
+#endif
 	&scaling_driver.attr,
 	&scaling_available_governors.attr,
 	&scaling_setspeed.attr,

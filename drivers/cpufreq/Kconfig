@@ -210,6 +210,15 @@ config CPU_FREQ_GOV_SCHEDUTIL
 
 	  If in doubt, say N.
 
+config CPU_FREQ_ONYX_PROFILE
+	bool "Onyx CPUFreq profile selector"
+	depends on ARCH_TUNA && CPU_FREQ_GOV_POWERSAVE=y && CPU_FREQ_GOV_PERFORMANCE=y
+	help
+	  Expose onyx_profile on each CPUFreq policy. Write powersave or
+	  performance to select the corresponding native governor; read to
+	  see the current governor, including one selected by other tools.
+	  This does not set frequency limits or select a governor at boot.
+
 comment "CPU frequency scaling drivers"
 
 config CPUFREQ_DT
